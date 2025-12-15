@@ -1,5 +1,6 @@
 import streamlit as st
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -14,8 +15,8 @@ st.set_page_config(
 
 st.title("📈 Stock Market Time-Series Dashboard")
 st.markdown(
-    "Data source: **Yahoo Finance** via `yfinance`. "
-    "Use the sidebar to change ticker, period, and indicators."
+    "Data source: **Yahoo Finance** via `yfinance` (when available). "
+    "If the data provider rate-limits us, we fall back to a synthetic demo dataset."
 )
 
 
@@ -49,14 +50,49 @@ indicators = st.sidebar.multiselect(
 
 # ---------- Helper Functions ----------
 @st.cache_data
-def load_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+def load_data_from_yfinance(ticker: str, period: str, interval: str) -> pd.DataFrame:
     """
     Fetch historical OHLCV data for a given ticker using yfinance.
     Uses Ticker().history to avoid MultiIndex column issues.
+    May raise YFRateLimitError or other exceptions.
     """
     t = yf.Ticker(ticker)
     df = t.history(period=period, interval=interval)
     df = df.reset_index()  # Date becomes a column
+    return df
+
+
+@st.cache_data
+def generate_synthetic_data(ticker: str, n_points: int = 252) -> pd.DataFrame:
+    """
+    Generate a synthetic OHLCV time-series that looks like a stock price.
+    This is used as a fallback when yfinance is rate-limited.
+    """
+    np.random.seed(42)  # so demo is reproducible
+    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=n_points, freq="B")
+
+    # Simulate log-returns and build a price path
+    mu = 0.0005   # small drift
+    sigma = 0.02  # daily volatility
+    log_returns = np.random.normal(mu, sigma, size=n_points)
+    price = 100 * np.exp(np.cumsum(log_returns))  # start at 100
+
+    # Build OHLC around the "Close" price
+    close = price
+    open_ = close * (1 + np.random.normal(0, 0.002, size=n_points))
+    high = np.maximum(open_, close) * (1 + np.abs(np.random.normal(0, 0.005, size=n_points)))
+    low = np.minimum(open_, close) * (1 - np.abs(np.random.normal(0, 0.005, size=n_points)))
+    volume = np.random.randint(1e5, 5e5, size=n_points)
+
+    df = pd.DataFrame({
+        "Date": dates,
+        "Open": open_,
+        "High": high,
+        "Low": low,
+        "Close": close,
+        "Volume": volume,
+    })
+    df["Ticker"] = ticker
     return df
 
 
@@ -76,15 +112,32 @@ def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
     return pd.Series(rsi, index=series.index)
 
 
-# ---------- Main Logic ----------
+# ---------- Main Data Loading ----------
 if ticker.strip() == "":
     st.warning("Please enter a valid ticker symbol in the sidebar.")
     st.stop()
 
-df = load_data(ticker, period, interval)
+data_source = "yfinance"
+
+try:
+    df = load_data_from_yfinance(ticker, period, interval)
+except YFRateLimitError:
+    st.warning(
+        "⚠️ Yahoo Finance rate limit reached for this app. "
+        "Switching to a synthetic demo dataset so the dashboard still works."
+    )
+    df = generate_synthetic_data(ticker)
+    data_source = "synthetic"
+except Exception as e:
+    st.warning(
+        f"⚠️ Could not load data from Yahoo Finance due to: {type(e).__name__}. "
+        "Using a synthetic demo dataset instead."
+    )
+    df = generate_synthetic_data(ticker)
+    data_source = "synthetic"
 
 if df.empty:
-    st.error("No data found for this ticker/period. Try another combination.")
+    st.error("No data found or generated. Please try another ticker or refresh.")
     st.stop()
 
 # Ensure expected columns exist
@@ -94,7 +147,12 @@ if not expected_cols.issubset(set(df.columns)):
     st.dataframe(df.head())
     st.stop()
 
+st.caption(f"Current data source: **{data_source}**")
+
+
 # ---------- Feature Engineering ----------
+df = df.sort_values("Date").reset_index(drop=True)
+
 df["Return_pct"] = df["Close"].pct_change() * 100.0
 df["MA_20"] = df["Close"].rolling(window=20).mean()
 df["MA_50"] = df["Close"].rolling(window=50).mean()
@@ -120,13 +178,8 @@ max_close = df_clean["Close"].max()
 min_close = df_clean["Close"].min()
 avg_volume = df_clean["Volume"].mean()
 
-# Simple annualized volatility from daily returns (if interval is daily)
-if interval == "1d":
-    daily_vol = df_clean["Return_pct"].std()
-    ann_vol = daily_vol * np.sqrt(252)
-else:
-    # For non-daily intervals, just show std of returns
-    ann_vol = df_clean["Return_pct"].std()
+# Simple volatility measure from returns
+ann_vol = df_clean["Return_pct"].std()
 
 st.subheader(f"Summary for **{ticker}** ({period}, {interval})")
 
@@ -219,6 +272,6 @@ with data_tab:
     st.download_button(
         label="📥 Download data as CSV",
         data=csv,
-        file_name=f"{ticker}_time_series.csv",
+        file_name=f"{ticker}_time_series_{data_source}.csv",
         mime="text/csv",
     )
